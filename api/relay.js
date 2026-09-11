@@ -1,74 +1,100 @@
 export default async function handler(req, res) {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    return res.status(204).end();
+  }
+
   const targetUrl = req.query.url;
   if (!targetUrl) {
     return res.status(400).json({ error: 'Missing "url" query parameter' });
   }
 
+  let decodedTarget;
   try {
-    const url = new URL(targetUrl);
-    const response = await fetch(targetUrl, {
+    decodedTarget = decodeURIComponent(targetUrl);
+  } catch {
+    decodedTarget = targetUrl;
+  }
+
+  // Safety: don’t let it proxy itself forever
+  if (decodedTarget.includes('network-nine-alpha.vercel.app')) {
+    return res.status(400).json({ error: 'Refusing to proxy own domain' });
+  }
+
+  try {
+    const response = await fetch(decodedTarget, {
       headers: {
-        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': req.headers['accept'] || '*/*',
-        'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://open.spotify.com/',
+        'Origin': 'https://open.spotify.com',
       },
       redirect: 'follow',
     });
 
     const contentType = response.headers.get('content-type') || '';
     const isHtml = contentType.includes('text/html');
-    const isText = contentType.startsWith('text/') || contentType.includes('javascript') || contentType.includes('json') || contentType.includes('css');
+    const isTextLike = isHtml ||
+      contentType.includes('javascript') ||
+      contentType.includes('css') ||
+      contentType.includes('json') ||
+      contentType.startsWith('text/');
 
-    // Forward useful headers (strip the ones that break framing/proxying)
-    const headersToSkip = new Set([
+    // Strip headers that break framing / embedding
+    const skip = new Set([
       'content-encoding', 'content-length', 'transfer-encoding',
       'content-security-policy', 'content-security-policy-report-only',
-      'x-frame-options', 'frame-options',
-      'strict-transport-security',
+      'x-frame-options', 'frame-options', 'x-content-type-options',
+      'strict-transport-security'
     ]);
+
     response.headers.forEach((value, key) => {
-      if (!headersToSkip.has(key.toLowerCase())) {
+      if (!skip.has(key.toLowerCase())) {
         res.setHeader(key, value);
       }
     });
 
-    // Always allow CORS from your frontend
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS, POST, PUT, DELETE');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
 
-    if (isHtml || isText) {
+    if (isTextLike) {
       let body = await response.text();
 
       if (isHtml) {
-        const proxyBase = `https://network-nine-alpha.vercel.app/api/relay?url=`;
+        const proxyPrefix = 'https://network-nine-alpha.vercel.app/api/relay?url=';
 
-        // Rewrite absolute Spotify + CDN URLs so they go through the proxy
-        body = body
-          .replace(/(https?:\/\/(?:open\.)?spotify\.com)/gi, (match) => proxyBase + encodeURIComponent(match))
-          .replace(/(https?:\/\/[^"'\s]*spotifycdn\.com)/gi, (match) => proxyBase + encodeURIComponent(match))
-          .replace(/(https?:\/\/[^"'\s]*scdn\.co)/gi, (match) => proxyBase + encodeURIComponent(match))
-          .replace(/(https?:\/\/[^"'\s]*encore\.scdn\.co)/gi, (match) => proxyBase + encodeURIComponent(match))
-          // also catch protocol-relative
-          .replace(/(\/\/(?:open\.)?spotify\.com)/gi, (match) => proxyBase + encodeURIComponent('https:' + match))
-          .replace(/(\/\/[^"'\s]*spotifycdn\.com)/gi, (match) => proxyBase + encodeURIComponent('https:' + match))
-          .replace(/(\/\/[^"'\s]*scdn\.co)/gi, (match) => proxyBase + encodeURIComponent('https:' + match));
+        // Only rewrite absolute Spotify + CDN URLs that are NOT already proxied
+        body = body.replace(
+          /https?:\/\/(?:[a-z0-9-]+\.)*(?:spotify\.com|spotifycdn\.com|scdn\.co)[^"'\\\s>]*/gi,
+          (match) => {
+            if (match.includes('network-nine-alpha.vercel.app')) return match;
+            return proxyPrefix + encodeURIComponent(match);
+          }
+        );
 
-        // Optional: inject a base tag so relative paths also try the proxy
-        body = body.replace(/<head[^>]*>/i, (match) => {
-          return match + `\n<base href="${proxyBase}${encodeURIComponent(url.origin + '/')}">`;
-        });
+        // Also catch protocol-relative ones
+        body = body.replace(
+          /\/\/(?:[a-z0-9-]+\.)*(?:spotify\.com|spotifycdn\.com|scdn\.co)[^"'\\\s>]*/gi,
+          (match) => {
+            if (match.includes('network-nine-alpha.vercel.app')) return match;
+            return proxyPrefix + encodeURIComponent('https:' + match);
+          }
+        );
       }
 
       res.status(response.status).send(body);
     } else {
-      // Binary / other: stream it
-      const buffer = await response.arrayBuffer();
-      res.status(response.status).send(Buffer.from(buffer));
+      // Binary (fonts, images, etc.)
+      const buf = Buffer.from(await response.arrayBuffer());
+      res.status(response.status).send(buf);
     }
-  } catch (error) {
-    console.error('Proxy error:', error);
-    res.status(500).json({ error: 'Failed to fetch target', details: error.message });
+  } catch (err) {
+    console.error('Proxy error:', err);
+    res.status(500).json({ error: 'Proxy failed', message: err.message });
   }
 }
