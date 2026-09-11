@@ -1,40 +1,5 @@
 export default async function handler(req, res) {
-  let targetUrl = req.query.url;
-  /*
-   * ============================================================
-   * SPOTIFY PATH HANDLING
-   * ============================================================
-   *
-   * Normal proxy requests still work exactly like before:
-   *
-   * /api/relay?url=https://example.com
-   *
-   * Spotify can also make requests such as:
-   *
-   * /api/relay/search
-   * /api/relay/collection/tracks
-   *
-   * Those are converted back into Spotify URLs.
-   */
-
-  const requestPath = req.url.split('?')[0];
-
-  if (!targetUrl && requestPath.startsWith('/api/relay/')) {
-    const spotifyPath = requestPath.substring('/api/relay'.length);
-
-    targetUrl = `https://open.spotify.com${spotifyPath}`;
-
-    // Preserve query parameters for Spotify.
-    const queryIndex = req.url.indexOf('?');
-
-    if (queryIndex !== -1) {
-      const queryString = req.url.substring(queryIndex + 1);
-
-      if (queryString) {
-        targetUrl += `?${queryString}`;
-      }
-    }
-  }
+  const targetUrl = req.query.url;
 
   if (!targetUrl) {
     return res.status(400).json({
@@ -42,29 +7,20 @@ export default async function handler(req, res) {
     });
   }
 
-  let parsedUrl;
-
   try {
-    parsedUrl = new URL(targetUrl);
-  } catch {
-    return res.status(400).json({
-      error: 'Invalid target URL'
-    });
-  }
+    const parsedUrl = new URL(targetUrl);
 
-  try {
     const response = await fetch(parsedUrl.toString());
-
     let data = await response.text();
 
     const contentType = response.headers.get('content-type') || '';
 
     /*
      * ============================================================
-     * SPOTIFY-ONLY HTML REWRITING
+     * SPOTIFY ONLY
      * ============================================================
      *
-     * Nothing below this point modifies non-Spotify websites.
+     * Nothing is modified for other websites.
      */
 
     const isSpotify =
@@ -74,61 +30,105 @@ export default async function handler(req, res) {
 
     if (isSpotify && contentType.includes('text/html')) {
 
+      const proxyBase =
+        'https://network-nine-alpha.vercel.app/api/relay?url=';
+
       /*
-       * Convert Spotify root-relative links:
+       * Convert Spotify relative URLs into FULL proxy URLs.
        *
-       *     /search
+       * Example:
        *
-       * into:
+       * /search
        *
-       *     /api/relay/search
+       * becomes:
        *
-       * This keeps navigation inside your proxy.
+       * https://network-nine-alpha.vercel.app/api/relay?url=https%3A%2F%2Fopen.spotify.com%2Fsearch
        */
 
-      data = data.replace(
-        /(\b(?:href|src|action|poster|data-src)\s*=\s*)(["'])(\/(?!\/)[^"']*)\2/gi,
-        function (match, prefix, quote, path) {
+      function proxySpotifyUrl(value) {
+        try {
+          const absoluteUrl = new URL(value, parsedUrl.toString());
 
-          if (path.startsWith('/api/relay')) {
-            return match;
+          const hostname = absoluteUrl.hostname;
+
+          const spotify =
+            hostname === 'open.spotify.com' ||
+            hostname === 'spotify.com' ||
+            hostname.endsWith('.spotify.com');
+
+          if (!spotify) {
+            return value;
           }
 
-          return (
-            prefix +
-            quote +
-            '/api/relay' +
-            path +
-            quote
+          return proxyBase + encodeURIComponent(
+            absoluteUrl.toString()
           );
+
+        } catch {
+          return value;
+        }
+      }
+
+      /*
+       * Rewrite href, src, action, poster and data-src.
+       */
+      data = data.replace(
+        /(\b(?:href|src|action|poster|data-src)\s*=\s*)(["'])([^"']+)\2/gi,
+        function (match, prefix, quote, value) {
+
+          /*
+           * Only rewrite relative Spotify URLs.
+           *
+           * Leave these alone:
+           *   https://...
+           *   http://...
+           *   javascript:...
+           *   data:...
+           *   #
+           */
+
+          if (
+            value.startsWith('/') &&
+            !value.startsWith('//')
+          ) {
+            return (
+              prefix +
+              quote +
+              proxySpotifyUrl(value) +
+              quote
+            );
+          }
+
+          /*
+           * Handle //open.spotify.com/... URLs.
+           */
+          if (value.startsWith('//')) {
+            return (
+              prefix +
+              quote +
+              proxySpotifyUrl('https:' + value) +
+              quote
+            );
+          }
+
+          return match;
         }
       );
 
       /*
-       * Handle forms separately as well.
+       * Rewrite CSS url(...) references that point to
+       * Spotify-relative resources.
        */
-
       data = data.replace(
-        /(<form[^>]*\baction\s*=\s*)(["'])(\/(?!\/)[^"']*)\2/gi,
-        function (match, prefix, quote, path) {
-
-          if (path.startsWith('/api/relay')) {
-            return match;
-          }
-
-          return (
-            prefix +
-            quote +
-            '/api/relay' +
-            path +
-            quote
-          );
+        /url\(\s*(["']?)(\/(?!\/)[^"')]+)\1\s*\)/gi,
+        function (match, quote, value) {
+          return `url(${quote}${proxySpotifyUrl(value)}${quote})`;
         }
       );
     }
 
     /*
-     * Keep the original proxy's response behavior.
+     * Keep your original response behavior.
      */
 
     if (contentType) {
@@ -138,7 +138,7 @@ export default async function handler(req, res) {
     return res.status(response.status).send(data);
 
   } catch (error) {
-    console.error('Fetch error:', error);
+    console.error("Fetch error:", error);
 
     return res.status(500).json({
       error: 'Failed to fetch the target URL'
