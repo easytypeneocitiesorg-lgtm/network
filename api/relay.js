@@ -51,7 +51,7 @@ export default async function handler(req, res) {
         return `${attr}=${quote}${rewriteUrl(val)}${quote}`;
       });
 
-      // The Interceptor Script
+      // The Interceptor Script with data-no-proxy opt-out
       const interceptorScript = `
       <script>
         (function() {
@@ -77,16 +77,16 @@ export default async function handler(req, res) {
             return originalOpen.call(this, method, toProxy(url), ...args);
           };
 
-          // NEW: Intercept setAttribute (Crucial for game engines loading assets)
+          // Intercept setAttribute with opt-out
           const originalSetAttribute = Element.prototype.setAttribute;
           Element.prototype.setAttribute = function(name, value) {
-            if (['src', 'href', 'action'].includes(name.toLowerCase()) && typeof value === 'string') {
+            if (['src', 'href', 'action'].includes(name.toLowerCase()) && typeof value === 'string' && !this.hasAttribute('data-no-proxy')) {
               value = toProxy(value);
             }
             return originalSetAttribute.call(this, name, value);
           };
 
-          // Intercept property assignments dynamically
+          // Intercept property assignments dynamically with opt-out
           ['src', 'href'].forEach(attr => {
             const prototypes = [HTMLImageElement, HTMLScriptElement, HTMLAudioElement, HTMLLinkElement, HTMLIFrameElement];
             prototypes.forEach(proto => {
@@ -96,7 +96,11 @@ export default async function handler(req, res) {
                 const originalSet = desc.set;
                 Object.defineProperty(proto.prototype, attr, {
                   set: function(val) {
-                    originalSet.call(this, toProxy(val));
+                    if (this.hasAttribute('data-no-proxy')) {
+                      originalSet.call(this, val);
+                    } else {
+                      originalSet.call(this, toProxy(val));
+                    }
                   },
                   get: desc.get
                 });
@@ -104,7 +108,7 @@ export default async function handler(req, res) {
             });
           });
 
-          // NEW: Intercept Web Workers (Used for background processing)
+          // Intercept Web Workers 
           if (window.Worker) {
             const originalWorker = window.Worker;
             window.Worker = function(url, options) {
@@ -112,10 +116,10 @@ export default async function handler(req, res) {
             };
           }
           
-          // Keep navigation inside the iframe
+          // Keep navigation inside the iframe unless opted out
           document.addEventListener('click', function(e) {
             const a = e.target.closest('a');
-            if (a && a.hasAttribute('href')) {
+            if (a && a.hasAttribute('href') && !a.hasAttribute('data-no-proxy')) {
               const href = a.getAttribute('href');
               if (!href.startsWith('javascript:') && !href.startsWith('#')) {
                 e.preventDefault();
@@ -127,8 +131,8 @@ export default async function handler(req, res) {
       </script>`;
 
       html = html.includes('<head>') 
-        ? html.replace('<head>', `<head>${interceptorScript}`) 
-        : interceptorScript + html;
+        ? html.replace('<head>', `<head>\n${interceptorScript}`) 
+        : interceptorScript + '\n' + html;
 
       return res.status(response.status).send(html);
     }
