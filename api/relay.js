@@ -6,25 +6,22 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Max-Age', '86400');
     return res.status(204).end();
   }
-
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error: 'Missing "url" query parameter' });
-
   try {
     const response = await fetch(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': '*/*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
       },
       redirect: 'follow',
     });
-
     const finalUrl = response.url;
     let contentType = response.headers.get('content-type') || 'text/html';
     const proxyBase = `https://${req.headers.host}/api/relay?url=`;
-
     const rewriteUrl = (urlStr) => {
-      if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('javascript:') || urlStr.startsWith('#')) return urlStr;
+      if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('javascript:') || urlStr.startsWith('#') || urlStr.startsWith('blob:')) return urlStr;
       try {
         const absolute = new URL(urlStr, finalUrl).href;
         return proxyBase + encodeURIComponent(absolute);
@@ -32,7 +29,6 @@ export default async function handler(req, res) {
         return urlStr;
       }
     };
-
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
@@ -42,16 +38,14 @@ export default async function handler(req, res) {
     // 1. Process HTML
     if (contentType.includes('text/html')) {
       let html = await response.text();
-
       // Strip security attributes that break intercepted scripts
       html = html.replace(/\s+(integrity|crossorigin)\s*=\s*(["']).*?\2/gi, '');
-
       // Rewrite static HTML tags
       html = html.replace(/\b(src|href|action)\s*=\s*(["'])(.*?)\2/gi, (match, attr, quote, val) => {
         return `${attr}=${quote}${rewriteUrl(val)}${quote}`;
       });
 
-      // The Interceptor Script with data-no-proxy opt-out
+      // The Interceptor Script
       const interceptorScript = `
       <script>
         (function() {
@@ -59,22 +53,36 @@ export default async function handler(req, res) {
           const targetBase = '${finalUrl}';
           
           function toProxy(url) {
-            if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#') || url.startsWith(proxyBase)) return url;
+            if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#') || url.startsWith('blob:') || url.startsWith(proxyBase)) return url;
             try { return proxyBase + encodeURIComponent(new URL(url, targetBase).href); }
             catch(e) { return url; }
           }
           
-          // Intercept Fetch & XHR
+          // Intercept Fetch — only proxy GET/HEAD so uploads (POST) stay direct
           const originalFetch = window.fetch;
-          window.fetch = function(res, init) {
-            if (typeof res === 'string') res = toProxy(res);
-            else if (res instanceof Request) res = new Request(toProxy(res.url), init);
-            return originalFetch.call(this, res, init);
+          window.fetch = function(input, init = {}) {
+            const method = ((init && init.method) || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+            
+            // Leave POST/PUT/PATCH/DELETE alone (this fixes profile picture uploads)
+            if (method !== 'GET' && method !== 'HEAD') {
+              return originalFetch.call(this, input, init);
+            }
+
+            if (typeof input === 'string') {
+              input = toProxy(input);
+            } else if (input instanceof Request) {
+              input = new Request(toProxy(input.url), init);
+            }
+            return originalFetch.call(this, input, init);
           };
           
+          // Intercept XHR — only proxy GET/HEAD
           const originalOpen = XMLHttpRequest.prototype.open;
           XMLHttpRequest.prototype.open = function(method, url, ...args) {
-            return originalOpen.call(this, method, toProxy(url), ...args);
+            if (String(method).toUpperCase() === 'GET' || String(method).toUpperCase() === 'HEAD') {
+              url = toProxy(url);
+            }
+            return originalOpen.call(this, method, url, ...args);
           };
 
           // Intercept setAttribute with opt-out
@@ -133,7 +141,6 @@ export default async function handler(req, res) {
       html = html.includes('<head>') 
         ? html.replace('<head>', `<head>\n${interceptorScript}`) 
         : interceptorScript + '\n' + html;
-
       return res.status(response.status).send(html);
     }
 
@@ -150,7 +157,6 @@ export default async function handler(req, res) {
     // 3. Process Binary Assets & Scripts
     const arrayBuffer = await response.arrayBuffer();
     return res.status(response.status).send(Buffer.from(arrayBuffer));
-
   } catch (error) {
     console.error('Fetch error:', error);
     res.setHeader('Access-Control-Allow-Origin', '*');
