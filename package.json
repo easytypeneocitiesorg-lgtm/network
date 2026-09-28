@@ -1,7 +1,11 @@
 {
   "name": "web-utility",
   "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "start": "node"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
   }
 }
